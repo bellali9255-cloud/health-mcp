@@ -7,7 +7,8 @@
   "main": "health-server.js",
   "scripts": {
     "start": "node health-server.js",
-    "check": "node --check health-server.js && node --check shared/http-runtime.js"
+    "check": "node --check health-server.js && node --check shared/http-runtime.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

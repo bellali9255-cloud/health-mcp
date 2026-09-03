@@ -125,13 +125,40 @@ function summarizeSleepSessions(sessions, updatedAt) {
   return summary;
 }
 
+// Two sessions are the same night when their [start, end] spans overlap. A night that grew between
+// uploads (a later fetch extended its tail) comes back with a later end; keyed on end|duration it
+// would land beside the stored short version and be summed twice, so instead it replaces it. Truly
+// separate sessions on one day (a nap and the night) do not overlap and are both kept.
+function sleepSessionsOverlap(a, b) {
+  return a.start < b.end && b.start < a.end;
+}
+
+// The more complete version of a night: the one that ends later, tie-broken by more sleep captured.
+// A re-send only ever extends a session, so this keeps the corrected value and drops the stale one.
+function moreCompleteSleepSession(a, b) {
+  if (a.end !== b.end) return a.end > b.end ? a : b;
+  return Number(b.duration_min || 0) > Number(a.duration_min || 0) ? b : a;
+}
+
+function upsertSleepSession(sessions, incoming) {
+  const overlapIndex = sessions.findIndex((existing) => sleepSessionsOverlap(existing, incoming));
+  if (overlapIndex === -1) {
+    sessions.push(incoming);
+  } else {
+    sessions[overlapIndex] = moreCompleteSleepSession(sessions[overlapIndex], incoming);
+  }
+}
+
 function mergeSleepSessionsForDate(dataDir, date, incoming, updatedAt) {
   const filePath = recordPath(dataDir, date);
   const record = readRecord(filePath, { date });
-  const sessions = Array.isArray(record.sleep_sessions) ? record.sleep_sessions : [];
-  const byKey = new Map(sessions.map((session) => [session.session_key, session]));
-  for (const session of incoming) byKey.set(session.session_key, session);
-  record.sleep_sessions = [...byKey.values()].sort((a, b) => a.end.localeCompare(b.end));
+  const stored = Array.isArray(record.sleep_sessions) ? record.sleep_sessions : [];
+  // Rebuild through the same overlap rule so a file written by the old end|duration merge, which
+  // could hold one night twice, heals itself the next time any data for its date arrives.
+  const sessions = [];
+  for (const session of stored) upsertSleepSession(sessions, session);
+  for (const session of incoming) upsertSleepSession(sessions, session);
+  record.sleep_sessions = sessions.sort((a, b) => a.end.localeCompare(b.end));
   record.sleep = summarizeSleepSessions(record.sleep_sessions, updatedAt);
   writeRecordAtomic(filePath, record);
   return record;
