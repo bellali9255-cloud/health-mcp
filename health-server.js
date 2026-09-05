@@ -9,7 +9,6 @@ const { z } = require("zod");
 const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = require("./shared/http-runtime");
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
-const CYCLE_FILE_NAME = "cycle.json";
 const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "all"]);
 const TZ = process.env.HEALTH_TZ || "Asia/Shanghai";
 
@@ -23,21 +22,7 @@ function formatLocalDate(date) {
 }
 
 function validDate(value) {
-  return parseDateDay(value) !== null;
-}
-
-function parseDateDay(value) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
-  if (!match) return null;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const millis = Date.UTC(year, month - 1, day);
-  const date = new Date(millis);
-  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
-    return null;
-  }
-  return Math.floor(millis / 86400000);
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
 }
 
 function ensureDataDir(dataDir) {
@@ -54,93 +39,6 @@ function writeRecordAtomic(filePath, record) {
   const tempPath = `${filePath}.${process.pid}.tmp`;
   fs.writeFileSync(tempPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
   fs.renameSync(tempPath, filePath);
-}
-
-function cyclePath(dataDir) {
-  return path.join(ensureDataDir(dataDir), CYCLE_FILE_NAME);
-}
-
-function normalizePositiveInteger(value, name) {
-  const number = Number(value);
-  if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${name} must be a positive integer`);
-  return number;
-}
-
-function normalizeCycleConfig(body) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("body must be an object");
-  if (body.enabled === false) return { enabled: false };
-  if (body.enabled !== true) throw new Error("enabled must be true or false");
-
-  const lastStart = String(body.last_start || "");
-  const lastConfirmed = body.last_confirmed ? String(body.last_confirmed) : null;
-  if (!validDate(lastStart)) throw new Error("last_start must be YYYY-MM-DD");
-  if (lastConfirmed !== null && !validDate(lastConfirmed)) {
-    throw new Error("last_confirmed must be YYYY-MM-DD");
-  }
-  const cycleLengthDays = normalizePositiveInteger(body.cycle_length_days, "cycle_length_days");
-  const cyclePeriodDays = normalizePositiveInteger(body.cycle_period_days, "cycle_period_days");
-  if (cyclePeriodDays > cycleLengthDays) {
-    throw new Error("cycle_period_days must not exceed cycle_length_days");
-  }
-  return {
-    enabled: true,
-    last_start: lastStart,
-    cycle_length_days: cycleLengthDays,
-    cycle_period_days: cyclePeriodDays,
-    ...(lastConfirmed === null ? {} : { last_confirmed: lastConfirmed }),
-  };
-}
-
-function storeCycleConfig(dataDir, body) {
-  const config = normalizeCycleConfig(body);
-  const filePath = cyclePath(dataDir);
-  if (!config.enabled) {
-    try {
-      fs.unlinkSync(filePath);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-    return config;
-  }
-  writeRecordAtomic(filePath, config);
-  return config;
-}
-
-function readCycleConfig(dataDir) {
-  const config = readRecord(cyclePath(dataDir), null);
-  if (!config) return null;
-  try {
-    const normalized = normalizeCycleConfig(config);
-    return normalized.enabled ? normalized : null;
-  } catch {
-    return null;
-  }
-}
-
-function cycleContextForDate(config, date) {
-  if (!config?.enabled) return null;
-  const targetDay = parseDateDay(date);
-  const anchorDay = parseDateDay(config.last_start);
-  if (targetDay === null || anchorDay === null) return null;
-  const cycleLengthDays = Number(config.cycle_length_days);
-  const cyclePeriodDays = Number(config.cycle_period_days);
-  if (!Number.isSafeInteger(cycleLengthDays) || cycleLengthDays <= 0 ||
-      !Number.isSafeInteger(cyclePeriodDays) || cyclePeriodDays <= 0 ||
-      cyclePeriodDays > cycleLengthDays) return null;
-
-  // Positive modulo rolls forward across any number of missed cycles and also lets a corrected
-  // anchor re-label recent history without rewriting daily health files.
-  const offset = ((targetDay - anchorDay) % cycleLengthDays + cycleLengthDays) % cycleLengthDays;
-  const cycleStartDay = targetDay - offset;
-  const confirmedDay = parseDateDay(config.last_confirmed);
-  const confirmed = confirmedDay !== null &&
-    confirmedDay >= cycleStartDay && confirmedDay < cycleStartDay + cycleLengthDays;
-  const periodDay = offset + 1;
-  if (periodDay <= cyclePeriodDays) return { period_day: periodDay, confirmed };
-
-  const daysUntilPeriod = cycleLengthDays - offset;
-  if (daysUntilPeriod <= 3) return { days_until_period: daysUntilPeriod, confirmed };
-  return null;
 }
 
 function readRecord(filePath, fallback) {
@@ -368,26 +266,22 @@ function mergeHealthData(dataDir, body) {
   return current;
 }
 
-function readHealthRecords(dataDir, days, type, now = new Date()) {
+function readHealthRecords(dataDir, days, type) {
   const records = [];
-  const cycleConfig = readCycleConfig(dataDir);
   for (let index = 0; index < days; index += 1) {
-    const dateValue = new Date(now);
+    const dateValue = new Date();
     dateValue.setDate(dateValue.getDate() - index);
     const date = formatLocalDate(dateValue);
     const filePath = recordPath(dataDir, date);
     if (!fs.existsSync(filePath)) continue;
     const record = readRecord(filePath, null);
     if (!record) continue;
-    const cycle = cycleContextForDate(cycleConfig, record.date || date);
     if (type && type !== "all") {
       const filtered = { date: record.date || date };
       if (record[type]) filtered[type] = record[type];
       if (type === "sleep" && record.sleep_sessions) filtered.sleep_sessions = record.sleep_sessions;
-      if (cycle) filtered.cycle = cycle;
       records.push(filtered);
     } else {
-      if (cycle) record.cycle = cycle;
       records.push(record);
     }
   }
@@ -408,11 +302,6 @@ function buildSummaryText(records) {
       const duration = minutes ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : "";
       const deep = record.sleep.deep_min ? ` 深睡 ${record.sleep.deep_min}min` : "";
       parts.push(`睡眠 ${duration}${deep}${record.sleep.score ? ` 评分${record.sleep.score}` : ""}`);
-    }
-    if (record.cycle?.period_day) {
-      parts.push(`${record.cycle.confirmed ? "" : "预计"}经期第${record.cycle.period_day}天`);
-    } else if (record.cycle?.days_until_period) {
-      parts.push(`预计${record.cycle.days_until_period}天后来经期`);
     }
     return `${record.date}: ${parts.join(", ") || "无数据"}`;
   }).join("\n");
@@ -470,14 +359,6 @@ function createApp(options = {}) {
       res.status(400).json({ error: error.message });
     }
   });
-  app.post("/cycle", ...bearerMiddleware(ingestToken), (req, res) => {
-    try {
-      const config = storeCycleConfig(dataDir, req.body);
-      res.json({ ok: true, enabled: config.enabled });
-    } catch (error) {
-      res.status(400).json({ error: error.message });
-    }
-  });
   app.get("/api/health", ...bearerMiddleware(readToken), (req, res) => {
     const days = Math.min(62, Math.max(1, Number.parseInt(req.query.days, 10) || 7));
     const type = VALID_TYPES.has(req.query.type) ? req.query.type : "all";
@@ -502,11 +383,9 @@ if (require.main === module) main();
 
 module.exports = {
   buildSummaryText,
-  cycleContextForDate,
   createApp,
   formatLocalDate,
   mergeHealthData,
   normalizeSleepSession,
   readHealthRecords,
-  storeCycleConfig,
 };
