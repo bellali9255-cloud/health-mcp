@@ -158,6 +158,18 @@ test("cycle annotations are dynamic and never written into day files", () => {
   assert.match(buildSummaryText(records), /经期第3天/);
 });
 
+test("repeating a clear stays successful so the phone can retry it", () => {
+  const dir = tmpDataDir();
+  storeCycleConfig(dir, confirmedCycle);
+  storeCycleConfig(dir, { enabled: false });
+
+  // The phone wipes its local copy the moment the user switches the feature off, so a clear that
+  // never reached the server can only be settled by retrying this same tombstone later. Repeating
+  // it must stay a success rather than turning into an error the retry loop can never clear.
+  assert.deepEqual(storeCycleConfig(dir, { enabled: false }), { enabled: false });
+  assert.equal(fs.existsSync(path.join(dir, "cycle.json")), false);
+});
+
 test("disabling removes cycle storage and every output trace", () => {
   const dir = tmpDataDir();
   fs.writeFileSync(path.join(dir, "2026-09-05.json"), JSON.stringify({ date: "2026-09-05", steps: { total: 1234 } }));
