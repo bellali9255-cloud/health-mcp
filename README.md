@@ -54,13 +54,15 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 ## MCP 工具
 
 - `health_read(days, type)` — 读原始记录，`type` ∈ `steps` / `heart_rate` / `sleep` / `all`
-- `health_summary(days)` — 按天汇总，适合日常问答
+- `health_summary(days)` — 按天汇总，适合日常问答；启用经期上下文后，只在经期中或预计三天内来经期时追加提示
 
 MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 token，客户端请求头需加 `Authorization: Bearer <读取token>`。
 
 ## 数据
 
 按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。同一天重复上传自动合并：步数取较大值、心率按时间戳去重、睡眠 session 按「结束时间 + 时长」做稳定键去重。所以重复上传或手动补传历史都不会把数据搞乱。
+
+可选的经期上下文由手机端通过鉴权后的 `POST /cycle` 单独写入 `cycle.json`，只保存开始日、周期与经期天数及最近确认日；关闭后文件会被删除。它不提供排卵或受孕窗口预测，也不会写进每日健康记录。
 
 ## 许可
 
