@@ -3,8 +3,10 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
+const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { mergeHealthData, normalizeSleepSession } = require("./health-server");
+const { createApp, createHealthMcpServer, mergeHealthData, normalizeSleepSession } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -71,4 +73,52 @@ test("a file left duplicated by the old merge heals on the next upload", () => {
   const record = readDay(dir, "2026-09-02");
   assert.equal(record.sleep_sessions.length, 1, "pre-existing duplicates collapse to one");
   assert.equal(record.sleep.duration_min, 480);
+});
+
+test("MCP exposes the public health read contract and custom day ranges", async () => {
+  const dir = tmpDataDir();
+  for (const [date, total] of [["2026-09-02", 2000], ["2026-09-03", 3000], ["2026-09-04", 4000], ["2026-09-05", 5000], ["2026-09-06", 6000]]) {
+    mergeHealthData(dir, { date, type: "steps", data: { total } });
+  }
+  mergeHealthData(dir, { date: "2026-09-06", heart_rate: [
+    { timestamp: "2026-09-06T00:10:00Z", bpm: 60, resting_bpm: 58 },
+    { timestamp: "2026-09-06T00:50:00Z", bpm: 80 },
+  ], sleep: [{
+    session_start_time: "2026-09-05T15:30:00Z", session_end_time: "2026-09-05T23:30:00Z",
+    duration_seconds: 28800, stages: [],
+  }] });
+  const server = createHealthMcpServer(dir);
+  const client = new Client({ name: "public-health-test", version: "1" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const tools = await client.listTools();
+  assert.deepEqual(tools.tools.map((tool) => tool.name), ["health_read"]);
+  assert.deepEqual(Object.keys(tools.tools[0].inputSchema.properties), ["data_type", "time_range", "heart_rate_detail", "days"]);
+  const steps = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "steps", days: 5 } })).content[0].text);
+  assert.equal(steps.summaries.length, 5);
+  const hourly = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "heart_rate", heart_rate_detail: "hourly", time_range: "today" } })).content[0].text);
+  assert.equal(hourly.hourly_summaries.length, 1);
+  const summary = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "daily_summary", time_range: "today" } })).content[0].text);
+  assert.equal(summary.summaries[0].sleep.duration_min, 480);
+  await client.close();
+  await server.close();
+});
+
+test("cycle endpoint stores and clears independent cycle context", async () => {
+  const dir = tmpDataDir();
+  const app = createApp({ dataDir: dir, ingestToken: "1234567890abcdef" });
+  const listener = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => listener.once("listening", resolve));
+  const base = `http://127.0.0.1:${listener.address().port}`;
+  const config = { enabled: true, last_start: "2026-09-01", cycle_length_days: 28, cycle_period_days: 5, last_confirmed: "2026-09-05" };
+  let response = await fetch(`${base}/cycle`, { method: "POST", headers: { authorization: "Bearer 1234567890abcdef", "content-type": "application/json" }, body: JSON.stringify(config) });
+  assert.equal(response.status, 200);
+  mergeHealthData(dir, { date: "2026-09-05", type: "steps", data: { total: 100 } });
+  const result = require("./health-server").readHealthRecords(dir, 2, "all");
+  assert.deepEqual(result.find((record) => record.date === "2026-09-05").cycle, { period_day: 5, confirmed: true });
+  response = await fetch(`${base}/cycle`, { method: "POST", headers: { authorization: "Bearer 1234567890abcdef", "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
+  assert.equal(response.status, 200);
+  assert.equal(fs.existsSync(path.join(dir, "cycle.json")), false);
+  await new Promise((resolve) => listener.close(resolve));
 });

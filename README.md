@@ -8,7 +8,7 @@
 手环 ──蓝牙──> 手机 App ──HTTPS 上传──> 本服务 ──MCP──> ChatGPT / Claude / Codex / 其他客户端
 ```
 
-约 360 行，Express + MCP SDK，需 Node 20+。手机端 App 与完整图文教程见文末链接。
+Express + MCP SDK，需 Node 20+。手机端 App 与完整图文教程见文末链接。
 
 ## 安装
 
@@ -53,8 +53,19 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 
 ## MCP 工具
 
-- `health_read(days, type)` — 读原始记录，`type` ∈ `steps` / `heart_rate` / `sleep` / `all`
-- `health_summary(days)` — 按天汇总，适合日常问答
+服务只暴露一个 `health_read` 工具：
+
+- `data_type`：`current_status`、`steps`、`heart_rate`、`sleep`、`daily_summary`、`all`
+- `time_range`：`today` 或 `three_days`
+- `days`：除 `current_status` 外可自定义读取 1～62 天；传入后优先于 `time_range`
+- `heart_rate_detail`：仅用于 `heart_rate`，可选 `daily` 或 `hourly`；小时模式只返回每小时统计，不返回原始样本
+
+不传参数时返回紧凑的当前状态。`daily_summary` 每天包含步数、卡路里、心率、血氧、压力和睡眠摘要；
+`all` 还会附带睡眠明细。读取结果可能附带 `cycle` 经期上下文。
+
+经期配置使用上传门锁调用 `POST /cycle`，请求体包含 `enabled`、`last_start`、
+`cycle_length_days`、`cycle_period_days`，以及可选的 `last_confirmed`。关闭时发送 `{ "enabled": false }`，
+服务会删除独立的 `cycle.json`，不会写入每日健康记录。
 
 MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 token，客户端请求头需加 `Authorization: Bearer <读取token>`。
 

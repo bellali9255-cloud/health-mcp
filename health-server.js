@@ -10,6 +10,10 @@ const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = req
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
 const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "all"]);
+const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "daily_summary", "all"];
+const TIME_RANGES = ["three_days", "today"];
+const HEART_RATE_DETAILS = ["daily", "hourly"];
+const MAX_READ_DAYS = 62;
 const TZ = process.env.HEALTH_TZ || "Asia/Shanghai";
 
 function formatLocalDate(date) {
@@ -47,6 +51,62 @@ function readRecord(filePath, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function parseDateDay(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!match) return null;
+  const millis = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  const date = new Date(millis);
+  return date.getUTCFullYear() === Number(match[1]) && date.getUTCMonth() === Number(match[2]) - 1 && date.getUTCDate() === Number(match[3])
+    ? Math.floor(millis / 86400000) : null;
+}
+
+function normalizePositiveInteger(value, name) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${name} must be a positive integer`);
+  return number;
+}
+
+function normalizeCycleConfig(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("body must be an object");
+  if (body.enabled === false) return { enabled: false };
+  if (body.enabled !== true) throw new Error("enabled must be true or false");
+  const lastStart = String(body.last_start || "");
+  const lastConfirmed = body.last_confirmed ? String(body.last_confirmed) : null;
+  if (parseDateDay(lastStart) === null) throw new Error("last_start must be YYYY-MM-DD");
+  if (lastConfirmed !== null && parseDateDay(lastConfirmed) === null) throw new Error("last_confirmed must be YYYY-MM-DD");
+  const cycleLengthDays = normalizePositiveInteger(body.cycle_length_days, "cycle_length_days");
+  const cyclePeriodDays = normalizePositiveInteger(body.cycle_period_days, "cycle_period_days");
+  if (cyclePeriodDays > cycleLengthDays) throw new Error("cycle_period_days must not exceed cycle_length_days");
+  return { enabled: true, last_start: lastStart, cycle_length_days: cycleLengthDays, cycle_period_days: cyclePeriodDays, ...(lastConfirmed === null ? {} : { last_confirmed: lastConfirmed }) };
+}
+
+function cyclePath(dataDir) { return path.join(ensureDataDir(dataDir), "cycle.json"); }
+function readCycleConfig(dataDir) {
+  const config = readRecord(cyclePath(dataDir), null);
+  if (!config) return null;
+  try { const normalized = normalizeCycleConfig(config); return normalized.enabled ? normalized : null; } catch { return null; }
+}
+function storeCycleConfig(dataDir, body) {
+  const config = normalizeCycleConfig(body);
+  if (!config.enabled) { try { fs.unlinkSync(cyclePath(dataDir)); } catch (error) { if (error.code !== "ENOENT") throw error; } return config; }
+  writeRecordAtomic(cyclePath(dataDir), config);
+  return config;
+}
+function cycleContextForDate(config, date) {
+  if (!config || config.enabled !== true) return null;
+  const targetDay = parseDateDay(date); const anchorDay = parseDateDay(config.last_start);
+  const cycleLengthDays = Number(config.cycle_length_days); const cyclePeriodDays = Number(config.cycle_period_days);
+  if (targetDay === null || anchorDay === null || !Number.isSafeInteger(cycleLengthDays) || cycleLengthDays <= 0 || !Number.isSafeInteger(cyclePeriodDays) || cyclePeriodDays <= 0 || cyclePeriodDays > cycleLengthDays) return null;
+  const offset = ((targetDay - anchorDay) % cycleLengthDays + cycleLengthDays) % cycleLengthDays;
+  const cycleStartDay = targetDay - offset;
+  const confirmedDay = parseDateDay(config.last_confirmed);
+  const confirmed = confirmedDay !== null && confirmedDay >= cycleStartDay && confirmedDay < cycleStartDay + cycleLengthDays;
+  const periodDay = offset + 1;
+  if (periodDay <= cyclePeriodDays) return { period_day: periodDay, confirmed };
+  const daysUntilPeriod = cycleLengthDays - offset;
+  return daysUntilPeriod <= 3 ? { days_until_period: daysUntilPeriod, confirmed } : null;
 }
 
 function normalizeSleepSession(rawSession) {
@@ -268,6 +328,7 @@ function mergeHealthData(dataDir, body) {
 
 function readHealthRecords(dataDir, days, type) {
   const records = [];
+  const cycleConfig = readCycleConfig(dataDir);
   for (let index = 0; index < days; index += 1) {
     const dateValue = new Date();
     dateValue.setDate(dateValue.getDate() - index);
@@ -276,16 +337,120 @@ function readHealthRecords(dataDir, days, type) {
     if (!fs.existsSync(filePath)) continue;
     const record = readRecord(filePath, null);
     if (!record) continue;
+    const cycle = cycleContextForDate(cycleConfig, record.date || date);
     if (type && type !== "all") {
       const filtered = { date: record.date || date };
       if (record[type]) filtered[type] = record[type];
       if (type === "sleep" && record.sleep_sessions) filtered.sleep_sessions = record.sleep_sessions;
+      if (cycle) filtered.cycle = cycle;
       records.push(filtered);
     } else {
+      if (cycle) record.cycle = cycle;
       records.push(record);
     }
   }
   return records;
+}
+
+function nullableNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+function latestSample(record) {
+  return (record?.heart_rate?.samples || [])
+    .map((sample) => ({ time: new Date(sample.ts || sample.timestamp || sample.time || ""), value: nullableNumber(sample.bpm ?? sample.value) }))
+    .filter((sample) => !Number.isNaN(sample.time.getTime()) && sample.value !== null)
+    .sort((a, b) => a.time - b.time).at(-1)?.value ?? null;
+}
+
+function heartRateSummary(record) {
+  const values = (record?.heart_rate?.samples || []).map((sample) => nullableNumber(sample.bpm ?? sample.value)).filter((value) => value !== null);
+  return {
+    hr_max: values.length ? Math.max(...values) : null,
+    hr_min: values.length ? Math.min(...values) : null,
+    hr_avg: nullableNumber(record?.heart_rate?.avg) ?? (values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : null),
+    hr_resting: nullableNumber(record?.heart_rate?.resting),
+  };
+}
+
+function dailySummary(record) {
+  return {
+    date: record.date,
+    steps: nullableNumber(record?.steps?.total),
+    calories: nullableNumber(record?.active_calories?.total ?? record?.total_calories?.total),
+    ...heartRateSummary(record),
+    stress_avg: nullableNumber(record?.stress?.avg ?? record?.stress),
+    spo2_avg: nullableNumber(record?.spo2?.avg ?? record?.spo2 ?? record?.blood_oxygen),
+    sleep: record.sleep ? {
+      duration_min: nullableNumber(record.sleep.duration_min), deep_min: nullableNumber(record.sleep.deep_min),
+      light_min: nullableNumber(record.sleep.light_min), rem_min: nullableNumber(record.sleep.rem_min),
+      awake_min: nullableNumber(record.sleep.awake_min), score: nullableNumber(record.sleep.score),
+    } : null,
+  };
+}
+
+function formatSleepClock(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: TZ, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(date).reduce((result, part) => { result[part.type] = part.value; return result; }, {});
+  return `${parts.month}/${parts.day} ${parts.hour}:${parts.minute}`;
+}
+
+function sleepSession(record, session) {
+  const stageMinutes = (names) => (session.stages || []).reduce((total, stage) => String(stage.stage ?? "").toLowerCase() && names.some((name) => String(stage.stage ?? "").toLowerCase() === name || String(stage.stage ?? "").toLowerCase().includes(name)) ? total + Math.round(Number(stage.duration_seconds || 0) / 60) : total, 0);
+  const deep = stageMinutes(["5", "deep"]); const light = stageMinutes(["4", "light"]); const rem = stageMinutes(["6", "rem"]); const awake = stageMinutes(["1", "3", "7", "awake", "out_of_bed"]);
+  const duration = nullableNumber(session.duration_min) ?? 0;
+  const result = { type: awake > 0 && deep === 0 && light === 0 && rem === 0 ? "nap" : "sleep", start: formatSleepClock(session.start), end: formatSleepClock(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
+  if (result.type === "sleep") Object.assign(result, { deep_sleep_minutes: deep || nullableNumber(record?.sleep?.deep_min) || 0, light_sleep_minutes: light || nullableNumber(record?.sleep?.light_min) || 0, rem_sleep_minutes: rem || nullableNumber(record?.sleep?.rem_min) || 0 });
+  return result;
+}
+
+function sleepSessions(records) {
+  return records.flatMap((record) => {
+    const sessions = Array.isArray(record.sleep_sessions) && record.sleep_sessions.length ? record.sleep_sessions : (record.sleep?.start || record.sleep?.end ? [record.sleep] : []);
+    return sessions.map((session) => ({ session: sleepSession(record, session), end: new Date(session.end || "").getTime() }));
+  }).sort((a, b) => b.end - a.end).map(({ session }) => session);
+}
+
+function hourlyHeartRateSummaries(records) {
+  const buckets = new Map();
+  for (const record of records) for (const sample of record?.heart_rate?.samples || []) {
+    const value = nullableNumber(sample.bpm ?? sample.value); const date = new Date(sample.ts || sample.timestamp || sample.time || "");
+    if (value === null || Number.isNaN(date.getTime())) continue;
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false }).formatToParts(date).reduce((result, part) => { result[part.type] = part.value; return result; }, {});
+    const hour = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:00`;
+    if (!buckets.has(hour)) buckets.set(hour, []); buckets.get(hour).push(value);
+  }
+  return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([hour, values]) => ({ hour, hr_max: Math.max(...values), hr_min: Math.min(...values), hr_avg: Math.round(values.reduce((sum, value) => sum + value, 0) / values.length), sample_count: values.length }));
+}
+
+function parseHealthToolRequest(args = {}) {
+  const dataType = DATA_TYPES.includes(args.data_type) ? args.data_type : "current_status";
+  const customDays = Number.isSafeInteger(args.days) && args.days >= 1 && args.days <= MAX_READ_DAYS ? args.days : null;
+  const timeRange = customDays !== null ? "custom" : (args.time_range === "today" ? "today" : "three_days");
+  return { dataType, timeRange, days: customDays ?? (timeRange === "today" ? 1 : 3) };
+}
+
+function readHealthToolResult(dataDir, args = {}) {
+  const { dataType, timeRange, days } = parseHealthToolRequest(args);
+  const today = formatLocalDate(new Date());
+  const records = readHealthRecords(dataDir, dataType === "current_status" ? 3 : days, "all");
+  const summaries = records.map(dailySummary).sort((a, b) => a.date.localeCompare(b.date));
+  const todayRecord = records.find((record) => record.date === today) || {};
+  const sleep = sleepSessions(records);
+  const resultBase = { success: true, data_type: dataType };
+  const withCycle = (result) => todayRecord.cycle ? { ...result, cycle: todayRecord.cycle } : result;
+  if (dataType === "current_status") return withCycle({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), latest_sleep: sleep[0] || null });
+  const range = { ...resultBase, time_range: timeRange, days };
+  if (dataType === "steps") return withCycle({ ...range, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, summaries: summaries.map(({ date, steps, calories }) => ({ date, steps, calories })) });
+  if (dataType === "heart_rate") {
+    const result = withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, daily_summaries: summaries.map(({ date, hr_max, hr_min, hr_avg, hr_resting }) => ({ date, hr_max, hr_min, hr_avg, hr_resting })) });
+    return args.heart_rate_detail === "hourly" ? { ...result, detail: "hourly", hourly_summaries: hourlyHeartRateSummaries(records) } : result;
+  }
+  if (dataType === "sleep") return withCycle({ ...range, recent_sleep_list: sleep });
+  if (dataType === "daily_summary") return withCycle({ ...range, summaries });
+  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
 }
 
 function buildSummaryText(records) {
@@ -308,17 +473,14 @@ function buildSummaryText(records) {
 }
 
 function createHealthMcpServer(dataDir) {
-  const server = new McpServer({ name: "health", version: "1.0.0" });
-  server.tool("health_read", "读取步数、心率与睡眠历史。", {
-    days: z.number().int().min(1).max(62).optional(),
-    type: z.enum(["steps", "heart_rate", "sleep", "all"]).optional(),
-  }, async ({ days = 7, type = "all" }) => ({
-    content: [{ type: "text", text: JSON.stringify(readHealthRecords(dataDir, days, type), null, 2) }],
-  }));
-  server.tool("health_summary", "汇总最近的健康历史。", {
-    days: z.number().int().min(1).max(62).optional(),
-  }, async ({ days = 7 }) => ({
-    content: [{ type: "text", text: buildSummaryText(readHealthRecords(dataDir, days, "all")) }],
+  const server = new McpServer({ name: "health", version: "1.1.0" });
+  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、每日摘要或完整数据。", {
+    data_type: z.enum(DATA_TYPES).optional(),
+    time_range: z.enum(TIME_RANGES).optional(),
+    heart_rate_detail: z.enum(HEART_RATE_DETAILS).optional(),
+    days: z.number().int().min(1).max(MAX_READ_DAYS).optional(),
+  }, async (args) => ({
+    content: [{ type: "text", text: JSON.stringify(readHealthToolResult(dataDir, args), null, 2) }],
   }));
   return server;
 }
@@ -359,6 +521,14 @@ function createApp(options = {}) {
       res.status(400).json({ error: error.message });
     }
   });
+  app.post("/cycle", ...bearerMiddleware(ingestToken), (req, res) => {
+    try {
+      const config = storeCycleConfig(dataDir, req.body);
+      res.json({ ok: true, enabled: config.enabled });
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  });
   app.get("/api/health", ...bearerMiddleware(readToken), (req, res) => {
     const days = Math.min(62, Math.max(1, Number.parseInt(req.query.days, 10) || 7));
     const type = VALID_TYPES.has(req.query.type) ? req.query.type : "all";
@@ -383,9 +553,13 @@ if (require.main === module) main();
 
 module.exports = {
   buildSummaryText,
+  cycleContextForDate,
   createApp,
+  createHealthMcpServer,
   formatLocalDate,
   mergeHealthData,
   normalizeSleepSession,
   readHealthRecords,
+  readHealthToolResult,
+  storeCycleConfig,
 };
