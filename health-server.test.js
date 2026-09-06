@@ -6,7 +6,7 @@ const path = require("node:path");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { createApp, createHealthMcpServer, mergeHealthData, normalizeSleepSession } = require("./health-server");
+const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, mergeHealthData, normalizeSleepSession, readHealthRecords, storeCycleConfig } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -121,4 +121,38 @@ test("cycle endpoint stores and clears independent cycle context", async () => {
   assert.equal(response.status, 200);
   assert.equal(fs.existsSync(path.join(dir, "cycle.json")), false);
   await new Promise((resolve) => listener.close(resolve));
+});
+
+const confirmedCycle = {
+  enabled: true,
+  last_start: "2026-09-01",
+  cycle_length_days: 28,
+  cycle_period_days: 5,
+  last_confirmed: "2026-09-05",
+};
+
+test("cycle context includes only period days and the three-day warning", () => {
+  assert.deepEqual(cycleContextForDate(confirmedCycle, "2026-09-01"), { period_day: 1, confirmed: true });
+  assert.deepEqual(cycleContextForDate(confirmedCycle, "2026-09-05"), { period_day: 5, confirmed: true });
+  assert.equal(cycleContextForDate(confirmedCycle, "2026-09-06"), null);
+  assert.deepEqual(cycleContextForDate(confirmedCycle, "2026-09-26"), { days_until_period: 3, confirmed: true });
+});
+
+test("cycle annotations are dynamic and never written into day files", () => {
+  const dir = tmpDataDir();
+  fs.writeFileSync(path.join(dir, "2026-09-05.json"), JSON.stringify({ date: "2026-09-05", steps: { total: 8234 } }));
+  storeCycleConfig(dir, confirmedCycle);
+  const records = readHealthRecords(dir, 1, "all", new Date("2026-09-05T12:00:00+08:00"));
+  assert.deepEqual(records[0].cycle, { period_day: 5, confirmed: true });
+  assert.match(buildSummaryText(records), /经期第5天/);
+  assert.equal(readDay(dir, "2026-09-05").cycle, undefined);
+});
+
+test("invalid calendar dates are rejected and repeated clear stays successful", () => {
+  const dir = tmpDataDir();
+  assert.throws(() => storeCycleConfig(dir, { ...confirmedCycle, last_start: "2026-02-30" }), /last_start/);
+  storeCycleConfig(dir, confirmedCycle);
+  assert.deepEqual(storeCycleConfig(dir, { enabled: false }), { enabled: false });
+  assert.deepEqual(storeCycleConfig(dir, { enabled: false }), { enabled: false });
+  assert.equal(fs.existsSync(path.join(dir, "cycle.json")), false);
 });

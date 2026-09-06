@@ -26,7 +26,7 @@ function formatLocalDate(date) {
 }
 
 function validDate(value) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+  return parseDateDay(value) !== null;
 }
 
 function ensureDataDir(dataDir) {
@@ -326,11 +326,11 @@ function mergeHealthData(dataDir, body) {
   return current;
 }
 
-function readHealthRecords(dataDir, days, type) {
+function readHealthRecords(dataDir, days, type, now = new Date()) {
   const records = [];
   const cycleConfig = readCycleConfig(dataDir);
   for (let index = 0; index < days; index += 1) {
-    const dateValue = new Date();
+    const dateValue = new Date(now);
     dateValue.setDate(dateValue.getDate() - index);
     const date = formatLocalDate(dateValue);
     const filePath = recordPath(dataDir, date);
@@ -467,6 +467,11 @@ function buildSummaryText(records) {
       const duration = minutes ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : "";
       const deep = record.sleep.deep_min ? ` 深睡 ${record.sleep.deep_min}min` : "";
       parts.push(`睡眠 ${duration}${deep}${record.sleep.score ? ` 评分${record.sleep.score}` : ""}`);
+    }
+    if (record.cycle?.period_day) {
+      parts.push(`${record.cycle.confirmed ? "" : "预计"}经期第${record.cycle.period_day}天`);
+    } else if (record.cycle?.days_until_period) {
+      parts.push(`预计${record.cycle.days_until_period}天后来经期`);
     }
     return `${record.date}: ${parts.join(", ") || "无数据"}`;
   }).join("\n");
