@@ -157,6 +157,40 @@ test("SpO2, stress, and temperature samples merge, deduplicate, and remain indep
   await server.close();
 });
 
+test("raw sample metrics retain a complete day beyond the heart-rate cap", () => {
+  const dir = tmpDataDir();
+  const today = formatLocalDate(new Date());
+  const dayStart = new Date(`${today}T00:00:00+08:00`).getTime();
+  const samples = Array.from({ length: 400 }, (_, index) => ({
+    timestamp: new Date(dayStart + index * 60_000).toISOString(),
+    value: 95 + (index % 4),
+  }));
+
+  mergeHealthData(dir, { date: today, spo2: samples });
+
+  const stored = readDay(dir, today).spo2.samples;
+  assert.equal(stored.length, 400);
+  assert.equal(stored[0].ts, samples[0].timestamp);
+  assert.equal(stored.at(-1).ts, samples.at(-1).timestamp);
+});
+
+test("sample metric timestamps are canonicalized, deduplicated by instant, and invalid values are dropped", () => {
+  const dir = tmpDataDir();
+  const today = formatLocalDate(new Date());
+  mergeHealthData(dir, {
+    date: today,
+    stress: [
+      { timestamp: `${today}T08:00:00+08:00`, value: 30 },
+      { timestamp: `${today}T00:00:00Z`, value: 42 },
+      { timestamp: "not-a-timestamp", value: 99 },
+    ],
+  });
+
+  const stress = readDay(dir, today).stress;
+  assert.deepEqual(stress.samples, [{ ts: `${today}T00:00:00.000Z`, value: 42 }]);
+  assert.equal(stress.latest, 42);
+});
+
 test("cycle endpoint stores and clears independent cycle context", async () => {
   const dir = tmpDataDir();
   const app = createApp({ dataDir: dir, ingestToken: "1234567890abcdef" });

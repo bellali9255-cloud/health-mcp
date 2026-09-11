@@ -73,7 +73,7 @@ MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 tok
 
 按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。同一天重复上传自动合并：步数取较大值，心率、血氧、压力和体表温度按时间戳去重，睡眠 session 自动识别同一段延长后的记录。所以重复上传或手动补传历史都不会把数据搞乱。
 
-手机端可在原有上传 JSON 中增加 `spo2`、`stress` 和 `temperature` 数组。每个样本都包含 ISO 8601 `timestamp` 和数值 `value`；服务端也兼容 `percentage`、`score`、`temperature_celsius` 等字段名。现有 `steps`、`heart_rate`、`sleep` 格式保持不变。
+手机端可在原有上传 JSON 中增加 `spo2`、`stress` 和 `temperature` 数组。每个样本都包含合法的 ISO 8601 `timestamp` 和数值 `value`；服务端会把时间规范为 UTC ISO 字符串后按时刻去重，无效时间戳会丢弃。服务端也兼容 `percentage`、`score`、`temperature_celsius` 等字段名，并完整保留这些未降采样指标的单日原始样本。现有 `steps`、`heart_rate`、`sleep` 格式保持不变。
 
 ## 许可
 

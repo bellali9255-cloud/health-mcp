@@ -301,23 +301,26 @@ function mergeHealthData(dataDir, body) {
   for (const [metric, config] of Object.entries(SAMPLE_METRICS)) {
     if (type !== metric && body[metric] === undefined) continue;
     const existing = current[metric];
-    const samples = Array.isArray(existing?.samples) ? [...existing.samples] : [];
+    const samplesByTimestamp = new Map();
+    for (const entry of Array.isArray(existing?.samples) ? existing.samples : []) {
+      const sample = normalizeSampleMetricEntry(entry, config);
+      if (!sample) continue;
+      samplesByTimestamp.set(sample.ts, sample);
+    }
     const value = type === metric ? data : body[metric];
     const entries = Array.isArray(value) ? value : [value];
     for (const entry of entries) {
-      const object = entry && typeof entry === "object" ? entry : { value: entry };
-      const sampleValue = nullableNumber(config.aliases.map((alias) => object[alias]).find((candidate) => candidate !== undefined) ?? object.value);
-      if (sampleValue === null || sampleValue < config.min || sampleValue > config.max) continue;
-      const ts = object.timestamp || object.ts || object.time || now;
-      const sample = { ts, value: sampleValue };
-      const index = samples.findIndex((candidate) => candidate.ts === ts);
-      if (index === -1) samples.push(sample); else samples[index] = sample;
+      const sample = normalizeSampleMetricEntry(entry, config, now);
+      if (!sample) continue;
+      samplesByTimestamp.set(sample.ts, sample);
     }
+    const samples = [...samplesByTimestamp.values()];
     samples.sort((a, b) => a.ts.localeCompare(b.ts));
-    const retained = samples.slice(-288);
-    const values = retained.map((sample) => sample.value);
+    const values = samples.map((sample) => sample.value);
     current[metric] = {
-      samples: retained,
+      // Unlike heart rate, these raw TimeSample metrics are not pre-bucketed. The record is already
+      // scoped to one day, so retain the complete day instead of silently discarding early samples.
+      samples,
       ...(values.length ? {
         latest: values.at(-1),
         min: Math.min(...values),
@@ -390,6 +393,20 @@ function readHealthRecords(dataDir, days, type, now = new Date()) {
 function nullableNumber(value) {
   if (value === null || value === undefined || value === "") return null;
   return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+function canonicalTimestamp(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function normalizeSampleMetricEntry(entry, config, fallbackTimestamp = null) {
+  const object = entry && typeof entry === "object" ? entry : { value: entry };
+  const sampleValue = nullableNumber(config.aliases.map((alias) => object[alias]).find((candidate) => candidate !== undefined) ?? object.value);
+  if (sampleValue === null || sampleValue < config.min || sampleValue > config.max) return null;
+  const rawTimestamp = object.timestamp ?? object.ts ?? object.time ?? fallbackTimestamp;
+  const ts = canonicalTimestamp(rawTimestamp);
+  return ts === null ? null : { ts, value: sampleValue };
 }
 
 function latestSample(record) {
