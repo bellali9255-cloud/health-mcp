@@ -6,7 +6,7 @@ const path = require("node:path");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, mergeHealthData, normalizeSleepSession, readHealthRecords, storeCycleConfig } = require("./health-server");
+const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, formatLocalDate, mergeHealthData, normalizeSleepSession, readHealthRecords, storeCycleConfig } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -77,14 +77,22 @@ test("a file left duplicated by the old merge heals on the next upload", () => {
 
 test("MCP exposes the public health read contract and custom day ranges", async () => {
   const dir = tmpDataDir();
-  for (const [date, total] of [["2026-09-02", 2000], ["2026-09-03", 3000], ["2026-09-04", 4000], ["2026-09-05", 5000], ["2026-09-06", 6000]]) {
+  const dates = Array.from({ length: 5 }, (_, index) => {
+    const date = new Date();
+    date.setDate(date.getDate() - (4 - index));
+    return formatLocalDate(date);
+  });
+  for (const [index, date] of dates.entries()) {
+    const total = (index + 2) * 1000;
     mergeHealthData(dir, { date, type: "steps", data: { total } });
   }
-  mergeHealthData(dir, { date: "2026-09-06", heart_rate: [
-    { timestamp: "2026-09-06T00:10:00Z", bpm: 60, resting_bpm: 58 },
-    { timestamp: "2026-09-06T00:50:00Z", bpm: 80 },
+  const today = dates.at(-1);
+  const yesterday = dates.at(-2);
+  mergeHealthData(dir, { date: today, heart_rate: [
+    { timestamp: `${today}T00:10:00Z`, bpm: 60, resting_bpm: 58 },
+    { timestamp: `${today}T00:50:00Z`, bpm: 80 },
   ], sleep: [{
-    session_start_time: "2026-09-05T15:30:00Z", session_end_time: "2026-09-05T23:30:00Z",
+    session_start_time: `${yesterday}T23:30:00+08:00`, session_end_time: `${today}T07:30:00+08:00`,
     duration_seconds: 28800, stages: [],
   }] });
   const server = createHealthMcpServer(dir);
@@ -105,6 +113,50 @@ test("MCP exposes the public health read contract and custom day ranges", async 
   await server.close();
 });
 
+test("SpO2, stress, and temperature samples merge, deduplicate, and remain independently readable", async () => {
+  const dir = tmpDataDir();
+  const today = formatLocalDate(new Date());
+  mergeHealthData(dir, {
+    date: today,
+    type: "steps",
+    data: { total: 4321 },
+    spo2: [
+      { timestamp: `${today}T08:00:00+08:00`, value: 96 },
+      { timestamp: `${today}T09:00:00+08:00`, percentage: 98 },
+    ],
+    stress: [
+      { timestamp: `${today}T08:00:00+08:00`, score: 30 },
+      { timestamp: `${today}T09:00:00+08:00`, value: 42 },
+    ],
+    temperature: [{ timestamp: `${today}T09:00:00+08:00`, temperature_celsius: 34.65 }],
+  });
+  mergeHealthData(dir, { date: today, type: "spo2", data: { timestamp: `${today}T09:00:00+08:00`, value: 99 } });
+
+  const record = readDay(dir, today);
+  assert.equal(record.steps.total, 4321, "existing metrics must remain intact");
+  assert.deepEqual(record.spo2.samples.map(({ value }) => value), [96, 99]);
+  assert.equal(record.spo2.avg, 97.5);
+  assert.equal(record.stress.latest, 42);
+  assert.equal(record.temperature.latest, 34.65);
+
+  const filtered = readHealthRecords(dir, 1, "temperature");
+  assert.deepEqual(Object.keys(filtered[0]).sort(), ["date", "temperature"]);
+
+  const server = createHealthMcpServer(dir);
+  const client = new Client({ name: "sample-metrics-test", version: "1" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const spo2 = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "spo2", time_range: "today" } })).content[0].text);
+  const current = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "current_status" } })).content[0].text);
+  assert.equal(spo2.latest, 99);
+  assert.deepEqual(spo2.daily_summaries[0], { date: today, latest: 99, min: 96, max: 99, avg: 97.5 });
+  assert.equal(current.stress, 42);
+  assert.equal(current.temperature, 34.65);
+  await client.close();
+  await server.close();
+});
+
 test("cycle endpoint stores and clears independent cycle context", async () => {
   const dir = tmpDataDir();
   const app = createApp({ dataDir: dir, ingestToken: "1234567890abcdef" });
@@ -115,7 +167,7 @@ test("cycle endpoint stores and clears independent cycle context", async () => {
   let response = await fetch(`${base}/cycle`, { method: "POST", headers: { authorization: "Bearer 1234567890abcdef", "content-type": "application/json" }, body: JSON.stringify(config) });
   assert.equal(response.status, 200);
   mergeHealthData(dir, { date: "2026-09-05", type: "steps", data: { total: 100 } });
-  const result = require("./health-server").readHealthRecords(dir, 2, "all");
+  const result = require("./health-server").readHealthRecords(dir, 2, "all", new Date("2026-09-05T12:00:00+08:00"));
   assert.deepEqual(result.find((record) => record.date === "2026-09-05").cycle, { period_day: 5, confirmed: true });
   response = await fetch(`${base}/cycle`, { method: "POST", headers: { authorization: "Bearer 1234567890abcdef", "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
   assert.equal(response.status, 200);
@@ -156,3 +208,4 @@ test("invalid calendar dates are rejected and repeated clear stays successful", 
   assert.deepEqual(storeCycleConfig(dir, { enabled: false }), { enabled: false });
   assert.equal(fs.existsSync(path.join(dir, "cycle.json")), false);
 });
+

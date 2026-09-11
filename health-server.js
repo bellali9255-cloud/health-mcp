@@ -9,8 +9,13 @@ const { z } = require("zod");
 const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = require("./shared/http-runtime");
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
-const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "all"]);
-const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "daily_summary", "all"];
+const SAMPLE_METRICS = {
+  spo2: { aliases: ["spo2", "blood_oxygen", "oxygen_saturation", "percentage"], min: 1, max: 100 },
+  stress: { aliases: ["stress", "score"], min: 0, max: 100 },
+  temperature: { aliases: ["temperature", "temperature_celsius", "skin_temperature"], min: 1, max: 60 },
+};
+const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", ...Object.keys(SAMPLE_METRICS), "all"]);
+const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", ...Object.keys(SAMPLE_METRICS), "daily_summary", "all"];
 const TIME_RANGES = ["three_days", "today"];
 const HEART_RATE_DETAILS = ["daily", "hourly"];
 const MAX_READ_DAYS = 62;
@@ -293,6 +298,36 @@ function mergeHealthData(dataDir, body) {
     current.heart_rate.updatedAt = now;
   }
 
+  for (const [metric, config] of Object.entries(SAMPLE_METRICS)) {
+    if (type !== metric && body[metric] === undefined) continue;
+    const existing = current[metric];
+    const samples = Array.isArray(existing?.samples) ? [...existing.samples] : [];
+    const value = type === metric ? data : body[metric];
+    const entries = Array.isArray(value) ? value : [value];
+    for (const entry of entries) {
+      const object = entry && typeof entry === "object" ? entry : { value: entry };
+      const sampleValue = nullableNumber(config.aliases.map((alias) => object[alias]).find((candidate) => candidate !== undefined) ?? object.value);
+      if (sampleValue === null || sampleValue < config.min || sampleValue > config.max) continue;
+      const ts = object.timestamp || object.ts || object.time || now;
+      const sample = { ts, value: sampleValue };
+      const index = samples.findIndex((candidate) => candidate.ts === ts);
+      if (index === -1) samples.push(sample); else samples[index] = sample;
+    }
+    samples.sort((a, b) => a.ts.localeCompare(b.ts));
+    const retained = samples.slice(-288);
+    const values = retained.map((sample) => sample.value);
+    current[metric] = {
+      samples: retained,
+      ...(values.length ? {
+        latest: values.at(-1),
+        min: Math.min(...values),
+        max: Math.max(...values),
+        avg: Math.round((values.reduce((sum, sampleValue) => sum + sampleValue, 0) / values.length) * 100) / 100,
+      } : {}),
+      updatedAt: now,
+    };
+  }
+
   for (const caloriesType of ["active_calories", "total_calories"]) {
     if (body[caloriesType] !== undefined) {
       const total = Array.isArray(body[caloriesType])
@@ -364,6 +399,35 @@ function latestSample(record) {
     .sort((a, b) => a.time - b.time).at(-1)?.value ?? null;
 }
 
+function latestMetricValue(record, metric) {
+  const stored = record?.[metric];
+  if (stored && typeof stored === "object") {
+    const latest = nullableNumber(stored.latest);
+    if (latest !== null) return latest;
+    return (stored.samples || [])
+      .map((sample) => ({ time: new Date(sample.ts || sample.timestamp || sample.time || ""), value: nullableNumber(sample.value) }))
+      .filter((sample) => !Number.isNaN(sample.time.getTime()) && sample.value !== null)
+      .sort((a, b) => a.time - b.time).at(-1)?.value ?? nullableNumber(stored.avg);
+  }
+  if (metric === "spo2") return nullableNumber(stored ?? record?.blood_oxygen);
+  if (metric === "temperature") return nullableNumber(stored ?? record?.skin_temperature);
+  return nullableNumber(stored);
+}
+
+function sampleMetricSummary(record, metric) {
+  const stored = record?.[metric];
+  const values = Array.isArray(stored?.samples)
+    ? stored.samples.map((sample) => nullableNumber(sample.value)).filter((value) => value !== null)
+    : [];
+  const prefix = metric === "temperature" ? "temperature" : metric;
+  return {
+    [`${prefix}_latest`]: latestMetricValue(record, metric),
+    [`${prefix}_min`]: nullableNumber(stored?.min) ?? (values.length ? Math.min(...values) : null),
+    [`${prefix}_max`]: nullableNumber(stored?.max) ?? (values.length ? Math.max(...values) : null),
+    [`${prefix}_avg`]: nullableNumber(stored?.avg) ?? (values.length ? Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 100) / 100 : latestMetricValue(record, metric)),
+  };
+}
+
 function heartRateSummary(record) {
   const values = (record?.heart_rate?.samples || []).map((sample) => nullableNumber(sample.bpm ?? sample.value)).filter((value) => value !== null);
   return {
@@ -380,8 +444,9 @@ function dailySummary(record) {
     steps: nullableNumber(record?.steps?.total),
     calories: nullableNumber(record?.active_calories?.total ?? record?.total_calories?.total),
     ...heartRateSummary(record),
-    stress_avg: nullableNumber(record?.stress?.avg ?? record?.stress),
-    spo2_avg: nullableNumber(record?.spo2?.avg ?? record?.spo2 ?? record?.blood_oxygen),
+    ...sampleMetricSummary(record, "spo2"),
+    ...sampleMetricSummary(record, "stress"),
+    ...sampleMetricSummary(record, "temperature"),
     sleep: record.sleep ? {
       duration_min: nullableNumber(record.sleep.duration_min), deep_min: nullableNumber(record.sleep.deep_min),
       light_min: nullableNumber(record.sleep.light_min), rem_min: nullableNumber(record.sleep.rem_min),
@@ -441,7 +506,7 @@ function readHealthToolResult(dataDir, args = {}) {
   const sleep = sleepSessions(records);
   const resultBase = { success: true, data_type: dataType };
   const withCycle = (result) => todayRecord.cycle ? { ...result, cycle: todayRecord.cycle } : result;
-  if (dataType === "current_status") return withCycle({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), latest_sleep: sleep[0] || null });
+  if (dataType === "current_status") return withCycle({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: latestMetricValue(todayRecord, "spo2"), stress: latestMetricValue(todayRecord, "stress"), temperature: latestMetricValue(todayRecord, "temperature"), latest_sleep: sleep[0] || null });
   const range = { ...resultBase, time_range: timeRange, days };
   if (dataType === "steps") return withCycle({ ...range, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, summaries: summaries.map(({ date, steps, calories }) => ({ date, steps, calories })) });
   if (dataType === "heart_rate") {
@@ -449,8 +514,19 @@ function readHealthToolResult(dataDir, args = {}) {
     return args.heart_rate_detail === "hourly" ? { ...result, detail: "hourly", hourly_summaries: hourlyHeartRateSummaries(records) } : result;
   }
   if (dataType === "sleep") return withCycle({ ...range, recent_sleep_list: sleep });
+  if (SAMPLE_METRICS[dataType]) return withCycle({
+    ...range,
+    latest: records.map((record) => latestMetricValue(record, dataType)).find((value) => value !== null) ?? null,
+    daily_summaries: summaries.map((summary) => ({
+      date: summary.date,
+      latest: summary[`${dataType}_latest`],
+      min: summary[`${dataType}_min`],
+      max: summary[`${dataType}_max`],
+      avg: summary[`${dataType}_avg`],
+    })),
+  });
   if (dataType === "daily_summary") return withCycle({ ...range, summaries });
-  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
+  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestMetricValue(todayRecord, "spo2"), stress: latestMetricValue(todayRecord, "stress"), temperature: latestMetricValue(todayRecord, "temperature"), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
 }
 
 function buildSummaryText(records) {
@@ -462,6 +538,12 @@ function buildSummaryText(records) {
       const resting = record.heart_rate.resting ? `（静息 ${record.heart_rate.resting}）` : "";
       parts.push(`心率均值 ${record.heart_rate.avg} bpm${resting}`);
     }
+    const spo2 = latestMetricValue(record, "spo2");
+    const stress = latestMetricValue(record, "stress");
+    const temperature = latestMetricValue(record, "temperature");
+    if (spo2 !== null) parts.push(`血氧 ${spo2}%`);
+    if (stress !== null) parts.push(`压力 ${stress}`);
+    if (temperature !== null) parts.push(`体表温度 ${temperature}°C`);
     if (record.sleep) {
       const minutes = Number(record.sleep.duration_min || 0);
       const duration = minutes ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : "";
@@ -479,7 +561,7 @@ function buildSummaryText(records) {
 
 function createHealthMcpServer(dataDir) {
   const server = new McpServer({ name: "health", version: "1.1.0" });
-  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、每日摘要或完整数据。", {
+  server.tool("health_read", "读取健康数据：当前状态、步数、心率、血氧、压力、体表温度、睡眠、每日摘要或完整数据。", {
     data_type: z.enum(DATA_TYPES).optional(),
     time_range: z.enum(TIME_RANGES).optional(),
     heart_rate_detail: z.enum(HEART_RATE_DETAILS).optional(),
@@ -568,3 +650,4 @@ module.exports = {
   readHealthToolResult,
   storeCycleConfig,
 };
+

@@ -1,6 +1,6 @@
 # health-mcp · 自托管健康数据服务端
 
-把手环的步数、心率、睡眠落到你自己的服务器，并通过 MCP 暴露给 AI 助手读取。
+把手表的步数、心率、血氧、压力、体表温度和睡眠落到你自己的服务器，并通过 MCP 暴露给 AI 助手读取。
 
 配合手机端的 Gadgetbridge fork 使用：
 
@@ -55,12 +55,12 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 
 服务只暴露一个 `health_read` 工具：
 
-- `data_type`：`current_status`、`steps`、`heart_rate`、`sleep`、`daily_summary`、`all`
+- `data_type`：`current_status`、`steps`、`heart_rate`、`sleep`、`spo2`、`stress`、`temperature`、`daily_summary`、`all`
 - `time_range`：`today` 或 `three_days`
 - `days`：除 `current_status` 外可自定义读取 1～62 天；传入后优先于 `time_range`
 - `heart_rate_detail`：仅用于 `heart_rate`，可选 `daily` 或 `hourly`；小时模式只返回每小时统计，不返回原始样本
 
-不传参数时返回紧凑的当前状态。`daily_summary` 每天包含步数、卡路里、心率、血氧、压力和睡眠摘要；
+不传参数时返回紧凑的当前状态。`daily_summary` 每天包含步数、卡路里、心率、血氧、压力、体表温度和睡眠摘要；
 `all` 还会附带睡眠明细。读取结果可能附带 `cycle` 经期上下文。
 
 经期配置使用上传门锁调用 `POST /cycle`，请求体包含 `enabled`、`last_start`、
@@ -71,7 +71,9 @@ MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 tok
 
 ## 数据
 
-按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。同一天重复上传自动合并：步数取较大值、心率按时间戳去重、睡眠 session 按「结束时间 + 时长」做稳定键去重。所以重复上传或手动补传历史都不会把数据搞乱。
+按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。同一天重复上传自动合并：步数取较大值，心率、血氧、压力和体表温度按时间戳去重，睡眠 session 自动识别同一段延长后的记录。所以重复上传或手动补传历史都不会把数据搞乱。
+
+手机端可在原有上传 JSON 中增加 `spo2`、`stress` 和 `temperature` 数组。每个样本都包含 ISO 8601 `timestamp` 和数值 `value`；服务端也兼容 `percentage`、`score`、`temperature_celsius` 等字段名。现有 `steps`、`heart_rate`、`sleep` 格式保持不变。
 
 ## 许可
 
@@ -81,3 +83,4 @@ MIT（本服务端为独立代码）。手机端 Gadgetbridge fork 是 AGPLv3、
 
 完整端到端图文教程（含手机端安装、连手环、接入 AI）：
 <https://github.com/xiaoyou5602/band-health-sync/blob/master/docs/GUIDE.md>
+
